@@ -1,0 +1,174 @@
+pipeline {
+  agent any
+  stages {
+    stage('Set Vars') {
+        steps {
+            script {
+                // Setting the Author of Last commit
+                // echo "Set Variables for ${JOB_NAME}......"
+                // def commitAuthor = sh (script: 'git log -1 --pretty=format:"%an"', returnStdout: true).trim()
+                // echo "Last commit: ${commitAuthor}"
+                // env.AUTHOR = commitAuthor
+                def jobParts=env.JOB_NAME.split('/')
+                def jobName=jobParts[0]
+                APP_NAME="${jobName}-${JOB_BASE_NAME}"
+                echo "Application Name: $APP_NAME"
+
+                // Setting the H/W Configuration as per the Application
+                def hwConfigs = (jobName == 'retail-digital-e' || jobName == 'billers-s' || jobName == 'corebanking-payments-s') ? [reservedCpu: '140m', limitCpu: '210m', reservedMem: '1500Mi'] : [reservedCpu: '70m', limitCpu: '70m', reservedMem: '1500Mi']
+                ReservedCpu = hwConfigs.reservedCpu
+                LimitCpu = hwConfigs.limitCpu
+                ReservedMem = hwConfigs.reservedMem
+                echo "H/W Configs for Application $APP_NAME: $ReservedCpu,$LimitCpu,$ReservedMem"
+
+                // Setting the Mule Layer as per the Application
+                def layerMap = [e: 'enterprise', s: 'system', p: 'process']
+                layer = layerMap.find {jobName.endsWith(it.key) }?.value ?: 'unknown'
+                echo "Mule Layer: $layer"
+
+                // Setting the Deployment Parameters as per the Application
+                if("${JOB_BASE_NAME}" == "dev")
+                {
+                  Target = "almasraf-rtf-non-production"
+                  PlatformEnv = "DEV"
+                  Replicas = "1"
+                  MuleEnv = "dev"
+                  IngressUrl = "https://rtf.dev.api-internal.arbiftuat.com"
+                  CliendID = "clientIdDev"
+                  ClientSecret = "ClientSecretDev"
+                  EnvID = "9940bb01-25ee-45af-8dcb-43eade588de3"
+                }
+                else if("${JOB_BASE_NAME}" == "sit")
+                {
+                  Target = "almasraf-rtf-non-production"
+                  PlatformEnv = "SIT"
+                  Replicas = "1"
+                  MuleEnv = "sit"
+                  IngressUrl = "https://rtf.sit.api-internal.arbiftuat.com"
+                  CliendID = "ClientIdSit"
+                  ClientSecret = "ClientSecretSit"
+                  EnvID = "e37c679f-ee60-4b0e-9beb-d68c8df34e80"
+                }
+                else if("${JOB_BASE_NAME}" == "uat")
+                {
+                  Target = "almasraf-rtf-non-production"
+                  PlatformEnv = "UAT"
+                  Replicas = "1"
+                  MuleEnv = "uat"
+                  IngressUrl = "https://rtf.uat.api-internal.arbiftuat.com"
+                  CliendID = "ClientIdUat"
+                  ClientSecret = "clientSecretUat"
+                  EnvID = "2eb55c9a-7601-4e99-bccb-bc0bbe87a3bf"
+                }
+
+                // Generating the Token for fetching the API_ID of the Application
+                withCredentials([usernamePassword(credentialsId: 'Mulesoft_OPS_Admin_Credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                  def token = sh(returnStdout: true, script: "curl -Ss -x 172.16.143.24:8080 -d 'username=$USERNAME&password=$PASSWORD' https://eu1.anypoint.mulesoft.com/accounts/login | jq -r '.access_token'").trim()
+                  echo "Mulesoft Token: $token"
+                  env.TOKEN = token
+
+                  // Fetching the API_ID as per the Application
+                  def api_id = sh(returnStdout: true, script: "curl -x 172.16.143.24:8080 --silent --request GET https://eu1.anypoint.mulesoft.com/apimanager/api/v1/organizations/7653ae59-b86b-435b-b58a-6baf4f052e99/environments/$EnvID/apis --header 'Authorization: Bearer ${env.TOKEN}' | jq -r '.assets[]? | select(.assetId == \"${jobName}\") | .apis[0].id'").trim()
+                  echo "API ID: $api_id"
+                  env.API_ID = api_id
+                }
+            }
+        }
+    }
+    stage('SonarQube Analysis') {
+      steps {
+        echo "Starting the SonarQube Analysis... ${APP_NAME}"
+        sh "/opt/jenkins/sonar-scanner-4.7.0.2747-linux/bin/sonar-scanner -Dsonar.host.url=http://172.16.103.66:9000/ -Dsonar.projectName=${APP_NAME} -Dsonar.projectVersion=${BUILD_NUMBER} -Dsonar.projectKey=${APP_NAME} -Dsonar.projectBaseDir=${WORKSPACE}"
+      }
+    }
+    stage('Build') { 
+      steps {
+        echo "Building the Mule Application..."
+        sh "mvn clean"
+      }
+    }
+    stage('Publish') {
+      when {
+        expression { "${JOB_BASE_NAME}" == "dev" }
+      }
+      steps {
+        echo "Publishing the Mule Application..."
+        sh "mvn deploy -DskipTests -Dname=${APP_NAME} -DdeploymentName=${APP_NAME} -DdeploymentTarget=almasraf-rtf-non-production"
+        script {
+            // Get the POM version using Maven's help:evaluate
+            def pomVersion = sh(script: 'mvn help:evaluate -Dexpression=project.version -q -DforceStdout', returnStdout: true).trim()
+            
+            // Tag the dev branch with the POM version
+            sh "git tag -a ${pomVersion} -m 'Tagging ${pomVersion}' --force"
+            sh 'git push origin --tags --force'
+        }
+      }
+    }
+    stage('Deploy') {
+      environment {
+        DEPLOY_CLIENT_ID = credentials("${CliendID}")
+        DEPLOY_CLIENT_SECRET = credentials("${ClientSecret}")
+      }
+      steps {
+        echo "Deploying the Mule Application..."
+        sh "mvn deploy \
+-DskipTests \
+-DmuleDeploy \
+-Dname=${APP_NAME} \
+-DdeploymentName=${APP_NAME} \
+-DdeploymentTarget=${Target} \
+-DplatformEnv=${PlatformEnv} \
+-Dapi.id=${API_ID} \
+-Dreplicas=${Replicas} \
+-Denv=${MuleEnv} \
+-DplatformClientId=${DEPLOY_CLIENT_ID} \
+-DplatformClientSecret=${DEPLOY_CLIENT_SECRET} \
+-DreservedCpu=${ReservedCpu} \
+-DlimitCpu=${LimitCpu} \
+-DreservedMem=${ReservedMem} \
+-DforceReplica=false \
+-DingressUrl=${IngressUrl} \
+-Danypoint.platform.visualizer.layer=${layer}"
+      }
+    }
+    stage('jMeter') { 
+      steps {
+        sh '/opt/apache-jmeter-5.4.3/bin/jmeter.sh -Jjmeter.save.saveservice.output_format=xml -n -t /opt/HTTPRequest.jmx -l /opt/testresult.jtl' 
+      }
+    }
+    stage('Owasp') {
+      steps {
+        sh "ssh -q root@172.16.103.67 /opt/owasp/ZAP_2.11.1/zap.sh -cmd -quickurl ${IngressUrl}/${APP_NAME}/v1/health-check -quickout /opt/owasp/scripts/${APP_NAME}.html"
+        sh "scp -qr root@172.16.103.67:/opt/owasp/scripts/${APP_NAME}.html /opt/jenkins/owaspreports/ && ls -la /opt/jenkins/owaspreports/${APP_NAME}.html"
+      }
+    }
+  }
+  post {
+    failure {
+      // sh """
+      //     curl -s --insecure -X POST 'https://jira.com/rest/api/2/issue/' -H 'Cache-Control: no-cache' -H 'Content-Type: application/json' -H 'Authorization: Bearer MDc1OTE5OTUzNTcyOj+dvUaQFDZwAoYgYDaHkn4BauqZ' -d'{"fields":{"project":{"key":"MI"},"summary":"Jenkins Build Failed: ${APP_NAME}","description":"The Jenkins Build Failed for ${APP_NAME}. Please check the below Jenkins Build URL, ${env.BUILD_URL}","issuetype":{"name":"Bug"},"assignee":{"name":"${env.AUTHOR}"}}}'
+      // """
+      emailext (
+          subject: "Build Status for ${currentBuild.fullDisplayName}: ${currentBuild.currentResult}",
+          body: """
+          The build status of ${APP_NAME} is ${currentBuild.currentResult}. ${env.BUILD_URL}
+          ${currentBuild.description ? "Description: " + currentBuild.description : ""}
+          Console Output:
+          \${BUILD_LOG, maxLines=42, escapeHtml=false}
+          """,
+          to: 'Bharghava.Raghavan@abc.ae,
+          attachLog: true
+		  )
+    }
+    success { 
+      perfReport sourceDataFiles: '/opt/testresult.jtl', showTrendGraphs: true, errorUnstableThreshold: -1, errorFailedThreshold: -1
+      publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: true, reportDir: '/opt/jenkins/owaspreports', reportFiles: "${APP_NAME}.html", reportName: 'OWASP ZAP Report', useWrapperFileDirectly: true])
+
+      emailext (
+          subject: "Build Status for ${currentBuild.fullDisplayName}: ${currentBuild.currentResult}",
+          body: "The build status of ${APP_NAME} is ${currentBuild.currentResult}. ${env.BUILD_URL}",
+          to: 'Bharghava.Raghavan@abc.ae'
+		  )
+    }
+  }
+}
